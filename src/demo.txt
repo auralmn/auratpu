@@ -1,0 +1,3 @@
+AURA is a neuromorphic language model.
+It learns with spikes, Oja rules, and streaming attention.
+This is a tiny demo corpus for quick shakedown.
