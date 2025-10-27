@@ -39,16 +39,38 @@ DEFAULT_DTYPE = torch.bfloat16 if XLA_AVAILABLE else torch.float32
 
 # ---------- Tokenizer (byte-level) ----------
 
+
+# --- PATCH: add memory/RAG to AURA Mini ---
+import os, math, json, time, argparse, random
+from pathlib import Path
+from typing import Dict, Optional, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from neuromorphic_srwkv_tpu import NeuromorphicSRWKVTpu, get_device, DEFAULT_DTYPE as SRWKV_DTYPE
+
+# Memory store
+from memory_store import MemoryStore
+
+# ---------- Tokenizer (byte-level + memory specials) ----------
 class ByteTokenizer:
     def __init__(self):
         # bytes 0..255 + special tokens
-        self.PAD, self.BOS, self.EOS = 256, 257, 258
-        self.vocab_size = 259
+        self.PAD, self.BOS, self.EOS, self.MEM, self.SEP = 256, 257, 258, 259, 260
+        self.vocab_size = 261
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         ids = list(text.encode('utf-8', errors='ignore'))
         if add_special:
             return [self.BOS] + ids + [self.EOS]
         return ids
+    def encode_memory_prefix(self, docs: List[str]) -> List[int]:
+        ids = [self.MEM]
+        for i, d in enumerate(docs):
+            ids += self.encode(d, add_special=False)
+            if i != len(docs)-1: ids += [self.SEP]
+        return ids + [self.SEP]
     def decode(self, ids: List[int]) -> str:
         bytes_list = [i for i in ids if 0 <= i < 256]
         try:
@@ -56,8 +78,7 @@ class ByteTokenizer:
         except Exception:
             return bytes(bytes_list).decode('latin-1', errors='ignore')
 
-# ---------- RMSNorm & MLP ----------
-
+# Inject the updated tokenizer and RAG into the existing file by replacing the prior sections.
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -185,6 +206,27 @@ def train_worker(index, args):
 
     ds = PackedDataset(lines, tok, args.seq_len)
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    ms = MemoryStore(args.memory_dir) if args.memory_dir else None
+    def maybe_replay(batch_x: torch.Tensor, batch_y: torch.Tensor):
+        if ms is None or args.replay_ratio <= 0.0:
+            return batch_x, batch_y
+        B, T = batch_x.shape
+        n_replay = int(B * args.replay_ratio)
+        if n_replay == 0:
+            return batch_x, batch_y
+        # Sample random memory items and replace first n_replay samples
+        import random
+        idxs = random.sample(range(len(ms.items)), k=min(n_replay, len(ms.items))) if len(ms.items)>0 else []
+        for j, mi in enumerate(idxs):
+            txt = ms.items[mi].text[:args.seq_len]
+            ids = tok.encode(txt, add_special=True)
+            ids = ids[:args.seq_len]
+            if len(ids)<2: ids = ids + [tok.PAD]
+            xj = torch.tensor(ids[:-1], dtype=torch.long)
+            yj = torch.tensor(ids[1:], dtype=torch.long)
+            batch_x[j,:] = xj
+            batch_y[j,:] = yj
+        return batch_x, batch_y
 
     # Model
     model = AURAMiniLM(
@@ -206,6 +248,35 @@ def train_worker(index, args):
     steps = 0
     for epoch in range(args.epochs):
         for x, y in dl:
+            # --- RAG assemble ---
+            if args.memory_dir and args.rag_mode != 'off':
+                ms = MemoryStore(args.memory_dir)
+                B, T = x.shape
+                new_x = []
+                new_y = []
+                for i in range(B):
+                    # decode a short query from the first 200 bytes
+                    q = tok.decode(x[i].tolist()[:200])
+                    hits = ms.search(q, top_k=args.mem_topk)
+                    mem_texts = [h[0].text[:400] for h in hits]
+                    mem_ids = tok.encode_memory_prefix(mem_texts)
+                    # prepend or append and trim to seq_len-1 (since we shift y)
+                    if args.rag_mode == 'prepend':
+                        merged = (mem_ids + x[i].tolist())[:args.seq_len]
+                    elif args.rag_mode == 'append':
+                        merged = (x[i].tolist() + mem_ids)[:args.seq_len]
+                    else:
+                        merged = x[i].tolist()
+                    # rebuild targets as next-token
+                    merged = merged if len(merged)>=2 else merged + [tok.PAD]
+                    nx = torch.tensor(merged[:-1], dtype=torch.long)
+                    ny = torch.tensor(merged[1:], dtype=torch.long)
+                    new_x.append(nx)
+                    new_y.append(ny)
+                x = torch.stack(new_x, dim=0)
+                y = torch.stack(new_y, dim=0)
+            # --- end RAG ---
+            x, y = maybe_replay(x, y)
             x = x.to(device)
             y = y.to(device)
             logits = model(x)
@@ -246,6 +317,10 @@ def main():
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--max-lines', type=int, default=None)
     ap.add_argument('--log-every', type=int, default=20)
+    ap.add_argument('--memory-dir', type=str, default=None)
+    ap.add_argument('--mem-topk', type=int, default=3)
+    ap.add_argument('--rag-mode', type=str, default='prepend', choices=['prepend', 'append', 'off'])
+    ap.add_argument('--replay-ratio', type=float, default=0.0)
     ap.add_argument('--tpu', action='store_true')
     args = ap.parse_args()
 

@@ -2,18 +2,23 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-AURA Neuromorphic SRWKV (TPU/XLA-ready)
+AURA Neuromorphic SRWKV (TPU/XLA-ready) + Streaming Softmax
+
 - Drop-in alternative to neuromorphic_srwkv_flash.py for TPUv4-32.
 - No custom CUDA/OpenCL kernels; uses pure Torch ops that XLA compiles.
-- Optional "chunked attention" approximates FlashAttention behavior (lower memory).
+- Attention modes:
+    * 'dot'      : standard scaled dot-product attention (full T x T)
+    * 'chunked'  : block-by-block softmax to reduce peak memory
+    * 'streaming': numerically stable streaming softmax (online over KV blocks)
+                   with running max & partition function accumulation.
 
-Key changes:
-- Device plumbing for PyTorch/XLA (TPU) with BF16 default.
-- Spiking k-WTA rewritten as tensor ops using scatter/bincount (stateless per forward).
-- Attention path:
-    * 'chunked' attention: block-by-block scaled dot product with softmax.
-    * or standard dot-product attention as fallback.
-- Retains SRWKV-style time mixing and neuromorphic spikes.
+The 'streaming' variant computes, per query row, the following recurrence over KV blocks b:
+    m_new = max(m, max(scores_b))
+    alpha = exp(m - m_new)
+    Z_new = Z * alpha + sum(exp(scores_b - m_new))
+    O_new = O * alpha + exp(scores_b - m_new) @ V_b
+Then output = O_new / Z_new, identical to full softmax(QK^T)V in exact arithmetic.
+We compute in float32 internally for stability on BF16 TPUs, and cast back.
 """
 
 from __future__ import annotations
@@ -55,18 +60,14 @@ DEFAULT_DTYPE = torch.bfloat16 if XLA_AVAILABLE else torch.float32
 
 @dataclass
 class SpikingConfig:
-    decay: float = 0.7          # membrane leak factor [0,1)
-    threshold: float = 1.0      # spiking threshold
-    k_winners: int = 5          # number of k-WTA winners
-    gain_up: float = 1.5        # LR multiplier for winners
-    gain_down: float = 0.6      # LR multiplier for non-winners
-    reset_mode: str = "soft"    # "soft" or "hard"
+    decay: float = 0.7
+    threshold: float = 1.0
+    k_winners: int = 5
+    gain_up: float = 1.5
+    gain_down: float = 0.6
+    reset_mode: str = "soft"
 
 class SpikingKWTA(nn.Module):
-    """
-    Spike-based k-WTA implemented with tensors for XLA.
-    Stateless across calls; computes decayed potentials and spike counts for a sequence.
-    """
     def __init__(self, config: SpikingConfig, dtype: torch.dtype = DEFAULT_DTYPE, device: Optional[torch.device] = None):
         super().__init__()
         self.config = config
@@ -75,13 +76,6 @@ class SpikingKWTA(nn.Module):
 
     @torch.no_grad()
     def forward(self, token_ids: torch.Tensor, vocab_size: Optional[int] = None) -> torch.Tensor:
-        """
-        Args:
-            token_ids: (..., ) integer tensor of token IDs (batch, seq) or (seq,)
-            vocab_size: optional vocabulary size; if None, inferred as max+1
-        Returns:
-            gains: (vocab_size,) tensor with LR multipliers on self.device
-        """
         ids = token_ids.to(self.device).view(-1)
         if ids.numel() == 0:
             return torch.ones(vocab_size if vocab_size is not None else 1, device=self.device, dtype=self.dtype)
@@ -90,23 +84,16 @@ class SpikingKWTA(nn.Module):
         decay = torch.as_tensor(self.config.decay, device=self.device, dtype=self.dtype)
         thr = torch.as_tensor(self.config.threshold, device=self.device, dtype=self.dtype)
 
-        # State tensors
         potentials = torch.zeros(V, device=self.device, dtype=self.dtype)
         spikes = torch.zeros(V, device=self.device, dtype=torch.int32)
 
-        # Process sequence step-by-step (XLA will compile this loop)
-        # For batched tokens at step t, use bincount to add one per token id.
         L = ids.numel()
         for t in range(L):
-            # Leak
             potentials.mul_(decay)
-
-            # Add current token(s)
-            tid = ids[t:t+1]  # single id in this scan; keeps semantics with original
+            tid = ids[t:t+1]
             delta = torch.bincount(tid, minlength=V).to(self.dtype)
             potentials.add_(delta)
 
-            # Spike where threshold crossed
             mask = potentials >= thr
             if mask.any():
                 spikes.masked_scatter_(mask, (spikes[mask] + 1))
@@ -115,17 +102,14 @@ class SpikingKWTA(nn.Module):
                 else:
                     potentials[mask] = 0
 
-        # Compute k-WTA gains
         gains = torch.ones(V, device=self.device, dtype=self.dtype)
         active = spikes > 0
         if int(active.sum().item()) > 0:
-            # Top-k by spike count; tie-breaker by residual potential
-            values = spikes.to(torch.float32) * 1e6 + potentials.to(torch.float32)  # big weight to spike counts
+            values = spikes.to(torch.float32) * 1e6 + potentials.to(torch.float32)
             k = min(self.config.k_winners, V)
             topk = torch.topk(values, k=k, largest=True).indices
             gains = gains.scatter(0, active.nonzero(as_tuple=False).view(-1), torch.as_tensor(self.config.gain_down, device=self.device, dtype=self.dtype))
             gains[topk] = torch.as_tensor(self.config.gain_up, device=self.device, dtype=self.dtype)
-
         return gains
 
 
@@ -134,28 +118,21 @@ class SpikingKWTA(nn.Module):
 # -----------------------------
 
 class NeuromorphicSRWKVTpu(nn.Module):
-    """
-    SRWKV with neuromorphic spikes + TPU-friendly attention.
-    """
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
 
-        # SRWKV parameters
         self.embedding_dim = int(config.get('embedding_dim', 256))
         self.num_heads = int(config.get('num_heads', 8))
         assert self.embedding_dim % self.num_heads == 0, "embedding_dim must be divisible by num_heads"
         self.head_dim = self.embedding_dim // self.num_heads
 
-        # Neuromorphic parameters
         self.spike_threshold = float(config.get('spike_threshold', 0.5))
         self.decay_factor = float(config.get('decay_factor', 0.9))
 
-        # Attention mode
-        self.attn_mode = str(config.get('attn_mode', 'chunked'))  # 'chunked' | 'dot'
+        self.attn_mode = str(config.get('attn_mode', 'streaming'))  # 'streaming' | 'chunked' | 'dot'
         self.block_size_q = int(config.get('block_size_q', 64))
         self.block_size_kv = int(config.get('block_size_kv', 64))
 
-        # Spiking k-WTA
         self.kwta = SpikingKWTA(
             SpikingConfig(
                 decay=float(config.get('kwta_decay', 0.7)),
@@ -169,24 +146,20 @@ class NeuromorphicSRWKVTpu(nn.Module):
             device=get_device()
         )
 
-        # NLMS-like gains
         self.mu_token = float(config.get('mu_token', 0.3))
         self.mu_context = float(config.get('mu_context', 0.8))
         self.adaptation_rate = float(config.get('adaptation_rate', 0.1))
 
-        # Projections
         D = self.embedding_dim
         self.receptance = nn.Linear(D, D, bias=False)
         self.key = nn.Linear(D, D, bias=False)
         self.value = nn.Linear(D, D, bias=False)
         self.output_projection = nn.Linear(D, D)
 
-        # Time mixing
         self.time_mix_k = nn.Parameter(torch.ones(1, 1, D))
         self.time_mix_v = nn.Parameter(torch.ones(1, 1, D))
         self.time_mix_r = nn.Parameter(torch.ones(1, 1, D))
 
-        # Buffers / state
         dev = get_device()
         self.register_buffer('learning_rates', torch.ones(D, device=dev, dtype=DEFAULT_DTYPE))
         self.register_buffer('adaptation_ema', torch.zeros((), device=dev, dtype=DEFAULT_DTYPE))
@@ -196,7 +169,6 @@ class NeuromorphicSRWKVTpu(nn.Module):
         self.device_ = dev
         self.to(dev)
 
-        # Init
         self.initialize()
 
     def initialize(self) -> bool:
@@ -220,7 +192,6 @@ class NeuromorphicSRWKVTpu(nn.Module):
         thr = torch.as_tensor(self.spike_threshold, device=x.device, dtype=x.dtype)
         spikes = (x > thr).to(x.dtype)
         if self.training:
-            # Straight-through est. with triangular window around threshold
             ste = torch.clamp(1 - torch.abs(x - thr), 0, 1)
             spikes = spikes + ste - ste.detach()
         return spikes
@@ -247,7 +218,6 @@ class NeuromorphicSRWKVTpu(nn.Module):
         return t.transpose(1, 2).contiguous().view(B, T, H * Hd)
 
     def scaled_dot_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        # q,k,v: [B,H,T,Dh]
         scale = 1.0 / math.sqrt(self.head_dim)
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale           # [B,H,T,T]
         attn = F.softmax(scores, dim=-1)                                 # [B,H,T,T]
@@ -256,21 +226,13 @@ class NeuromorphicSRWKVTpu(nn.Module):
 
     def chunked_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                           block_q: int, block_kv: int) -> torch.Tensor:
-        """
-        Memory-friendlier attention evaluated block-by-block along query length.
-        q,k,v: [B,H,T,Dh]
-        Returns: [B,H,T,Dh]
-        """
         B, H, T, Dh = q.shape
         scale = 1.0 / math.sqrt(Dh)
-
         outputs = []
         for q_start in range(0, T, block_q):
             q_end = min(q_start + block_q, T)
             q_blk = q[:, :, q_start:q_end, :]                              # [B,H,Bq,Dh]
 
-            # Compute scores for this query block against all keys in chunks to cap temporary memory
-            # Accumulate softmax in one go per query-block (ok for moderate T).
             scores_blk = []
             for kv_start in range(0, T, block_kv):
                 kv_end = min(kv_start + block_kv, T)
@@ -281,19 +243,72 @@ class NeuromorphicSRWKVTpu(nn.Module):
 
             attn_blk = F.softmax(scores_blk, dim=-1)                        # [B,H,Bq,T]
 
-            # Multiply by V in chunks
             out_blk = torch.zeros(B, H, q_end - q_start, Dh, device=q.device, dtype=q.dtype)
             kv_cursor = 0
             for kv_start in range(0, T, block_kv):
                 kv_end = min(kv_start + block_kv, T)
-                v_blk = v[:, :, kv_start:kv_end, :]                         # [B,H,Bk,Dh]
-                a_slice = attn_blk[:, :, :, kv_cursor:kv_cursor + (kv_end - kv_start)]  # [B,H,Bq,Bk]
-                out_blk = out_blk + torch.matmul(a_slice, v_blk)            # accumulate
+                v_blk = v[:, :, kv_start:kv_end, :]
+                a_slice = attn_blk[:, :, :, kv_cursor:kv_cursor + (kv_end - kv_start)]
+                out_blk = out_blk + torch.matmul(a_slice, v_blk)
                 kv_cursor += (kv_end - kv_start)
 
-            outputs.append(out_blk)                                         # [B,H,Bq,Dh]
+            outputs.append(out_blk)
+        return torch.cat(outputs, dim=2)
 
-        return torch.cat(outputs, dim=2)                                    # [B,H,T,Dh]
+    def streaming_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                            block_q: int, block_kv: int) -> torch.Tensor:
+        """
+        Numerically stable streaming softmax attention.
+        Processes KV in blocks and maintains running (m, Z, O) per query row:
+          m: running max logits
+          Z: partition function sum of exp(logits - m)
+          O: weighted value accumulator
+        All accumulators are float32 regardless of input dtype for stability on TPU.
+        """
+        B, H, T, Dh = q.shape
+        scale = 1.0 / math.sqrt(Dh)
+
+        outputs = []
+        for q_start in range(0, T, block_q):
+            q_end = min(q_start + block_q, T)
+            q_blk = q[:, :, q_start:q_end, :]                                  # [B,H,Bq,Dh]
+
+            # Compute in FP32
+            qf = q_blk.to(torch.float32)
+            mf = torch.full((B, H, q_end - q_start, 1), -float('inf'), device=q.device, dtype=torch.float32)  # m
+            Zf = torch.zeros(B, H, q_end - q_start, 1, device=q.device, dtype=torch.float32)                   # Z
+            Of = torch.zeros(B, H, q_end - q_start, Dh, device=q.device, dtype=torch.float32)                  # O
+
+            for kv_start in range(0, T, block_kv):
+                kv_end = min(kv_start + block_kv, T)
+                k_blk = k[:, :, kv_start:kv_end, :]
+                v_blk = v[:, :, kv_start:kv_end, :]
+
+                kf = k_blk.to(torch.float32)
+                vf = v_blk.to(torch.float32)
+
+                # scores: [B,H,Bq,Bk]
+                scores = torch.matmul(qf, kf.transpose(-2, -1)) * scale
+                # block max along last dim
+                m_block = scores.max(dim=-1, keepdim=True).values                            # [B,H,Bq,1]
+                m_new = torch.maximum(mf, m_block)                                           # [B,H,Bq,1]
+
+                # alpha = exp(m - m_new)
+                alpha = torch.exp(mf - m_new)
+
+                # exp(scores - m_new)
+                exp_scores = torch.exp(scores - m_new)
+
+                # Update Z and O
+                Zf = Zf * alpha + exp_scores.sum(dim=-1, keepdim=True)                       # [B,H,Bq,1]
+                Of = Of * alpha + torch.matmul(exp_scores, vf)                                # [B,H,Bq,Dh]
+                mf = m_new
+
+            out_blk = Of / (Zf + 1e-9)                                                       # [B,H,Bq,Dh]
+            # Cast back to input dtype
+            outputs.append(out_blk.to(q.dtype))
+
+        return torch.cat(outputs, dim=2)                                                      # [B,H,T,Dh]
 
     # ---------- Core compute ----------
 
@@ -307,8 +322,7 @@ class NeuromorphicSRWKVTpu(nn.Module):
 
         # k-WTA learning gains
         if token_ids is not None:
-            gains_vec = self.kwta(token_ids, vocab_size=None)           # [V]
-            # Map gains to feature dim: pad/trim
+            gains_vec = self.kwta(token_ids, vocab_size=None)
             if gains_vec.numel() >= D:
                 learning_gains = gains_vec[:D]
             else:
@@ -317,11 +331,9 @@ class NeuromorphicSRWKVTpu(nn.Module):
         else:
             learning_gains = torch.ones(D, device=device, dtype=DEFAULT_DTYPE)
 
-        # Ensure prev_state has correct batch size
         if self.prev_state.size(0) != B:
             self.prev_state = torch.zeros(B, D, device=device, dtype=DEFAULT_DTYPE)
 
-        # SRWKV temporal path with adaptive mixing + spikes
         outputs = []
         current_state = self.prev_state.clone()
         for t in range(T):
@@ -338,9 +350,8 @@ class NeuromorphicSRWKVTpu(nn.Module):
             v_s = self.spike_activation(v_t)
             r_s = self.spike_activation(r_t)
 
-            outputs.append(r_s * k_s * v_s)  # [B,D]
+            outputs.append(r_s * k_s * v_s)
 
-            # Update state with adaptive decay (scalar)
             adaptive_decay = torch.as_tensor(self.decay_factor * float(learning_gains.mean().item()),
                                              device=device, dtype=DEFAULT_DTYPE)
             current_state = adaptive_decay * current_state + (1 - adaptive_decay) * x_t
@@ -348,12 +359,13 @@ class NeuromorphicSRWKVTpu(nn.Module):
         temporal = torch.stack(outputs, dim=1)  # [B,T,D]
         self.prev_state = current_state.detach()
 
-        # Global attention over neuromorphic sequence
         qh = self._reshape_to_heads(temporal)
         kh = self._reshape_to_heads(temporal)
         vh = self._reshape_to_heads(temporal)
 
-        if self.attn_mode == 'chunked':
+        if self.attn_mode == 'streaming':
+            out_h = self.streaming_attention(qh, kh, vh, self.block_size_q, self.block_size_kv)
+        elif self.attn_mode == 'chunked':
             out_h = self.chunked_attention(qh, kh, vh, self.block_size_q, self.block_size_kv)
         else:
             out_h = self.scaled_dot_attention(qh, kh, vh)
@@ -396,7 +408,7 @@ if __name__ == "__main__":
     cfg = {
         'embedding_dim': 256,
         'num_heads': 8,
-        'attn_mode': 'chunked',       # or 'dot'
+        'attn_mode': 'streaming',     # 'streaming' | 'chunked' | 'dot'
         'block_size_q': 32,
         'block_size_kv': 64,
         'spike_threshold': 0.5,
