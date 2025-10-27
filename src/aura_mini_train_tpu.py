@@ -186,6 +186,41 @@ class PackedDataset(torch.utils.data.Dataset):
 # Utilities: world/rank, ckpt, eval
 # -----------------------------------------------------------------------------
 
+# --- Smoothed loss meters + distributed mean ---
+class EmaMeter:
+    def __init__(self, beta: float = 0.98):
+        self.beta = float(beta)
+        self.value = None
+        self.count = 0
+    def update(self, x: float):
+        if self.value is None:
+            self.value = float(x)
+        else:
+            self.value = self.beta * self.value + (1.0 - self.beta) * float(x)
+        self.count += 1
+
+from collections import deque
+class WindowMean:
+    def __init__(self, window: int = 100):
+        self.buf = deque(maxlen=int(window))
+    def update(self, x: float):
+        self.buf.append(float(x))
+    @property
+    def value(self) -> float:
+        if not self.buf: return float('nan')
+        return sum(self.buf) / len(self.buf)
+    @property
+    def count(self) -> int:
+        return len(self.buf)
+
+def _dist_mean_scalar(x: float, device: torch.device) -> float:
+    """Average a Python float across TPU cores if XLA is present; else return x."""
+    if XLA_AVAILABLE:
+        t = torch.tensor([x], device=device, dtype=torch.float32)
+        xm.all_reduce(xm.REDUCE_MEAN, [t])
+        return float(t.item())
+    return float(x)
+
 def _world_size():
     if XLA_AVAILABLE:
         try: return xr.world_size()
@@ -295,6 +330,10 @@ def train_worker(index, args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
+    # Smoothed loss meters
+    ema_loss = EmaMeter(beta=args.ema_beta)
+    win_loss = WindowMean(window=args.avg_window)
+
     # Optional: tiny eval split from ds (works best for pretokenized)
     eval_dl = None
     if args.eval_fraction > 0.0:
@@ -342,14 +381,29 @@ def train_worker(index, args):
                 opt.step()
             scheduler.step()
 
+            # Compute per-step loss and distributed-average it
+            step_loss = accum_loss / max(1, m)
+            step_loss_global = _dist_mean_scalar(step_loss, device)
+            ema_loss.update(step_loss_global)
+            win_loss.update(step_loss_global)
+
             steps += 1
 
             if _is_master() and (steps % args.log_every == 0):
                 elapsed = time.time() - t0
                 toks_sec = tokens_per_step * (args.log_every / max(1e-6, elapsed))
-                ppl_est = math.exp(min(accum_loss / max(1, m), 20.0))
                 lr_now = scheduler.get_last_lr()[0]
-                print(f"ep {epoch+1} step {steps} | loss {accum_loss/m:.4f} | ppl {ppl_est:.2f} | lr {lr_now:.3e} | {toks_sec:,.0f} tok/s")
+
+                inst_ppl = math.exp(min(step_loss_global, 20.0))
+                ema_ppl  = math.exp(min(ema_loss.value, 20.0)) if ema_loss.count > 0 else float('nan')
+                win_ppl  = math.exp(min(win_loss.value, 20.0)) if win_loss.count > 0 else float('nan')
+
+                print(
+                    f"ep {epoch+1} step {steps} | "
+                    f"loss {step_loss_global:.4f} (ema {ema_loss.value:.4f}, win {win_loss.value:.4f}) | "
+                    f"ppl {inst_ppl:.2f} (ema {ema_ppl:.2f}, win {win_ppl:.2f}) | "
+                    f"lr {lr_now:.3e} | {toks_sec:,.0f} tok/s"
+                )
                 t0 = time.time()
 
             if args.save_every and steps % args.save_every == 0:
@@ -408,6 +462,8 @@ def main():
     ap.add_argument('--warmup-steps', type=int, default=200)
     ap.add_argument('--total-steps', type=int, default=0, help='0 = run full epochs')
     ap.add_argument('--grad-clip', type=float, default=1.0)
+    ap.add_argument('--ema-beta', type=float, default=0.98, help='EMA smoothing for loss display')
+    ap.add_argument('--avg-window', type=int, default=100, help='Rolling window size for mean loss')
 
     # Logging / eval / save
     ap.add_argument('--log-every', type=int, default=20)
