@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-AURA Mini LLM — TPU-ready trainer (torch-xla 2.8 compatible)
+AURA Mini LLM — TPU-ready trainer (torch-xla 2.8 / PJRT)
 
-- Uses PJRT (PJRT_DEVICE=TPU). For core count, set env TPU_NUM_DEVICES
-  (or restrict with TPU_VISIBLE_CHIPS). spawn() is called without nprocs.
-- Pre-tokenized mmap dataset (--bin-dir) or raw-text fallback.
+- Uses PJRT (set: PJRT_DEVICE=TPU). torch-xla 2.8 expects you to limit device
+  count via env: TPU_NUM_DEVICES (or TPU_VISIBLE_CHIPS); spawn() gets it.
+- Pre-tokenized mmap dataset (--bin-dir) for max throughput; raw-text fallback.
 - Neuromorphic SRWKV mixer with streaming softmax (from neuromorphic_srwkv_tpu.py).
 - Grad accumulation, grad clipping, cosine LR warmup/decay.
-- Smoothed loss meters (EMA + rolling window) averaged across TPU cores.
-- Rank-aware logging via xm.master_print.
+- Smoothed loss meters (EMA + rolling window), averaged across TPU cores.
+- Rank-aware logging via xm.master_print and --log-every.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ DEFAULT_DTYPE = torch.bfloat16 if XLA_AVAILABLE else torch.float32
 # -----------------------------------------------------------------------------
 # Neuromorphic mixer (your module)
 # -----------------------------------------------------------------------------
-from neuromorphic_srwkv_tpu import NeuromorphicSRWKVTpu, get_device, DEFAULT_DTYPE as SRWKV_DTYPE
+from neuromorphic_srwkv_tpu import NeuromorphicSRWKVTpu, get_device
 
 # -----------------------------------------------------------------------------
 # Tokenizer (byte-level with specials)
@@ -90,7 +90,7 @@ class AURABlock(nn.Module):
         cfg = {
             'embedding_dim': dim,
             'num_heads': heads,
-            'attn_mode': attn_mode,
+            'attn_mode': attn_mode,       # 'streaming' | 'chunked' | 'dot'
             'block_size_q': block_q,
             'block_size_kv': block_kv,
             'spike_threshold': 0.5,
@@ -247,7 +247,7 @@ def train_worker(index, args):
 
     tok = ByteTokenizer()
 
-    # Runtime world size / rank (now accurate inside worker)
+    # Runtime world size / rank (accurate inside worker)
     ws = _world_size()
     rk = _rank()
 
@@ -300,7 +300,8 @@ def train_worker(index, args):
     def lr_lambda(step):
         if step < args.warmup_steps:
             return max(1e-8, step / max(1, args.warmup_steps))
-        if args.total_steps <= args.warmup_steps: return 1.0
+        if args.total_steps <= args.warmup_steps or args.total_steps == 0:
+            return 1.0
         progress = (step - args.warmup_steps) / (args.total_steps - args.warmup_steps)
         progress = max(0.0, min(1.0, progress))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -424,7 +425,8 @@ def main():
     ap.add_argument('--total-steps', type=int, default=0)
     ap.add_argument('--grad-clip', type=float, default=1.0)
 
-    # Smoothed loss
+    # Logging / smoothing
+    ap.add_argument('--log-every', type=int, default=20, help='Steps between log lines (rank-0)')
     ap.add_argument('--ema-beta', type=float, default=0.98)
     ap.add_argument('--avg-window', type=int, default=100)
 
@@ -438,11 +440,9 @@ def main():
     if args.tpu:
         if not XLA_AVAILABLE:
             raise RuntimeError("torch-xla unavailable. Install torch-xla and set PJRT_DEVICE=TPU.")
-        # torch-xla 2.8 expects you to limit devices via env; spawn() picks them up.
         if args.tpu_cores and os.environ.get('TPU_NUM_DEVICES') is None:
             os.environ['TPU_NUM_DEVICES'] = str(int(args.tpu_cores))
-        # If you need to skip bad chips, set TPU_VISIBLE_CHIPS="0,1,3" in your shell before running.
-        xmp.spawn(train_worker, args=(args,), start_method='fork')
+        xmp.spawn(train_worker, args=(args,), start_method='fork')  # nprocs comes from env
     else:
         train_worker(0, args)
 
