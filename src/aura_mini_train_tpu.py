@@ -235,6 +235,14 @@ def _rank():
 
 _is_master = lambda: _rank() == 0
 
+def log(*args, **kwargs):
+    """Rank-aware logger: consolidates output on TPU master and flushes."""
+    msg = " ".join(str(a) for a in args)
+    if XLA_AVAILABLE:
+        xm.master_print(msg)
+    else:
+        print(msg, flush=True)
+
 @torch.no_grad()
 def evaluate(model: nn.Module, dl: torch.utils.data.DataLoader, device: torch.device,
              vocab_size: int, max_steps: int = 50) -> float:
@@ -305,6 +313,10 @@ def train_worker(index, args):
         pin_memory=False,
     )
 
+    # Startup logs
+    log(f"rank {_rank()}/{_world_size()} | device={device} | dtype={DEFAULT_DTYPE}")
+    log(f"dataset windows={len(ds)} | seq_len={args.seq_len} | batch_size={args.batch_size} | microbatches={args.microbatches} | log_every={args.log_every}")
+
     # Model
     model = AURAMiniLM(
         vocab_size=tok.vocab_size,
@@ -344,6 +356,7 @@ def train_worker(index, args):
 
     steps = 0
     tokens_per_step = args.batch_size * args.seq_len * max(1, _world_size()) * max(1, args.microbatches)
+    log(f"global tokens/step ≈ {tokens_per_step:,}")
     t0 = time.time()
 
     for epoch in range(args.epochs):
@@ -398,7 +411,7 @@ def train_worker(index, args):
                 ema_ppl  = math.exp(min(ema_loss.value, 20.0)) if ema_loss.count > 0 else float('nan')
                 win_ppl  = math.exp(min(win_loss.value, 20.0)) if win_loss.count > 0 else float('nan')
 
-                print(
+                log(
                     f"ep {epoch+1} step {steps} | "
                     f"loss {step_loss_global:.4f} (ema {ema_loss.value:.4f}, win {win_loss.value:.4f}) | "
                     f"ppl {inst_ppl:.2f} (ema {ema_ppl:.2f}, win {win_ppl:.2f}) | "
@@ -417,7 +430,7 @@ def train_worker(index, args):
                 break
         if eval_dl is not None and _is_master():
             ppl = evaluate(model, eval_dl, device, tok.vocab_size, max_steps=args.eval_steps)
-            print(f"\n[eval] epoch {epoch+1} ppl {ppl:.2f}")
+            log(f"\n[eval] epoch {epoch+1} ppl {ppl:.2f}")
         if args.total_steps and steps >= args.total_steps:
             break
 
@@ -427,7 +440,7 @@ def train_worker(index, args):
             'seq_len': args.seq_len, 'vocab_size': tok.vocab_size,
             'total_steps': steps,
         })
-        print("Saved final checkpoint: ckpts/aura_mini_final.pt")
+        log("Saved final checkpoint: ckpts/aura_mini_final.pt")
 
 # -----------------------------------------------------------------------------
 # CLI
