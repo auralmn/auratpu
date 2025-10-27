@@ -60,24 +60,17 @@ def _fetch_url(url: str, timeout: int = 15) -> Tuple[str, str]:
     return title, text
 
 class RandomProjectionEmbedder:
-    """Byte-histogram -> RP to d_out (device-agnostic)."""
+    """Byte-histogram -> RP to d_embed (device-agnostic)."""
     def __init__(self, d_out: int = 512, seed: int = 0):
         self.d_in = 259  # byte vocab + PAD/BOS/EOS used by tokenizer
+        self.d_out = d_out  # <-- assign first (NO walrus)
         g = torch.Generator().manual_seed(seed)
         # Achlioptas RP (sparse-ish): entries in {-1,0,1}
-        probs = torch.rand((self.d_out:=d_out, self.d_in), generator=g)
+        probs = torch.rand((self.d_out, self.d_in), generator=g)
         mat = torch.zeros_like(probs)
         mat[probs < 1/6] = -1.0
         mat[(probs >= 1/6) & (probs < 2/6)] = 1.0
         self.R = mat / math.sqrt(self.d_in)
-    def __call__(self, ids: List[int]) -> torch.Tensor:
-        # build byte histogram (259)
-        h = torch.zeros(self.d_in)
-        for t in ids:
-            if 0 <= t < self.d_in:
-                h[t] += 1.0
-        if h.sum() > 0: h = h / h.norm(p=2)
-        return self.R @ h  # [d_out]
 
 class MemoryStore:
     def __init__(self, path: str, d_embed: int = 512, embedder: Optional[Callable[[List[int]], torch.Tensor]] = None):
