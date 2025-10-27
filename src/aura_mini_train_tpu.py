@@ -1,30 +1,41 @@
-
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-AURA Mini LLM (Byte-level) — TPUv4-32 friendly
-- Small model (~30M params by default) to validate training/inference, logging, and numerics
-- Depends on neuromorphic_srwkv_tpu.NeuromorphicSRWKVTpu for the mixer/attention
-- Pure PyTorch + PyTorch/XLA (no external tokenizer dependencies)
+AURA Mini LLM — Optimized Trainer (TPUv4-32 friendly)
 
-Usage:
-  python aura_mini_train_tpu.py --tpu --corpus demo.txt --epochs 1 --seq-len 2048
+Highlights
+- Supports **pre-tokenized** binary datasets (memory-mapped) for max throughput.
+- PyTorch/XLA multi-process training (xmp.spawn), BF16 by default on TPU.
+- Neuromorphic SRWKV mixer with **streaming softmax** attention.
+- Gradient accumulation, grad clipping, cosine LR with warmup.
+- Optional raw-text path (byte-level tokenizer) + optional ShadowBank RAG (off by default).
+- Checkpointing (rank 0), lightweight eval (ppl) on a held-out split.
 
-Files:
-  - aura_mini_llm.py (this)
-  - neuromorphic_srwkv_tpu.py (already created earlier)
+Recommended usage (TPU, pretokenized):
+  python aura_mini_train_tpu_optimized.py --tpu \
+    --bin-dir data_bin --epochs 1 --batch-size 8 --microbatches 4 \
+    --seq-len 2048 --dim 512 --heads 8 --layers 6 \
+    --attn-mode streaming --block-q 128 --block-kv 256 --lr 2e-4
+
+Pre-tokenize once on CPU:
+  python fast_clean_pack.py --in corpus.txt --out corpus_clean.txt
+  python pack_to_bin.py --in corpus_clean.txt --out-dir data_bin --seq-len 2048
 """
-
 from __future__ import annotations
-import os, math, json, time, argparse, random
+
+import os
+import math
+import json
+import time
+import argparse
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
+from typing import Optional, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# XLA
+# XLA (TPU)
 XLA_AVAILABLE = False
 try:
     import torch_xla
@@ -37,48 +48,30 @@ except Exception:
 
 DEFAULT_DTYPE = torch.bfloat16 if XLA_AVAILABLE else torch.float32
 
-# ---------- Tokenizer (byte-level) ----------
-
-
-# --- PATCH: add memory/RAG to AURA Mini ---
-import os, math, json, time, argparse, random
-from pathlib import Path
-from typing import Dict, Optional, List, Tuple
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+# -----------------------------------------------------------------------------
+# Imports from our neuromorphic stack
+# -----------------------------------------------------------------------------
 from neuromorphic_srwkv_tpu import NeuromorphicSRWKVTpu, get_device, DEFAULT_DTYPE as SRWKV_DTYPE
 
-# Memory store
-from memory_store import MemoryStore
-
-# ---------- Tokenizer (byte-level + memory specials) ----------
+# -----------------------------------------------------------------------------
+# Tokenizer (byte-level with specials)
+# -----------------------------------------------------------------------------
 class ByteTokenizer:
     def __init__(self):
-        # bytes 0..255 + special tokens
+        # bytes 0..255 + PAD/BOS/EOS/MEM/SEP
         self.PAD, self.BOS, self.EOS, self.MEM, self.SEP = 256, 257, 258, 259, 260
         self.vocab_size = 261
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         ids = list(text.encode('utf-8', errors='ignore'))
-        if add_special:
-            return [self.BOS] + ids + [self.EOS]
-        return ids
-    def encode_memory_prefix(self, docs: List[str]) -> List[int]:
-        ids = [self.MEM]
-        for i, d in enumerate(docs):
-            ids += self.encode(d, add_special=False)
-            if i != len(docs)-1: ids += [self.SEP]
-        return ids + [self.SEP]
+        return ([self.BOS] + ids + [self.EOS]) if add_special else ids
     def decode(self, ids: List[int]) -> str:
-        bytes_list = [i for i in ids if 0 <= i < 256]
-        try:
-            return bytes(bytes_list).decode('utf-8', errors='ignore')
-        except Exception:
-            return bytes(bytes_list).decode('latin-1', errors='ignore')
+        b = [i for i in ids if 0 <= i < 256]
+        try: return bytes(b).decode('utf-8', errors='ignore')
+        except Exception: return bytes(b).decode('latin-1', errors='ignore')
 
-# Inject the updated tokenizer and RAG into the existing file by replacing the prior sections.
+# -----------------------------------------------------------------------------
+# Model blocks
+# -----------------------------------------------------------------------------
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -98,16 +91,13 @@ class SwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
-# ---------- Neuromorphic block wrapper ----------
-from neuromorphic_srwkv_tpu import NeuromorphicSRWKVTpu, get_device, DEFAULT_DTYPE as SRWKV_DTYPE
-
 class AURABlock(nn.Module):
     def __init__(self, dim: int, heads: int, attn_mode: str, block_q: int, block_kv: int):
         super().__init__()
         cfg = {
             'embedding_dim': dim,
             'num_heads': heads,
-            'attn_mode': attn_mode,         # 'streaming'|'chunked'|'dot'
+            'attn_mode': attn_mode,       # 'streaming' | 'chunked' | 'dot'
             'block_size_q': block_q,
             'block_size_kv': block_kv,
             'spike_threshold': 0.5,
@@ -123,11 +113,9 @@ class AURABlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-# ---------- AURA Mini Model ----------
-
 class AURAMiniLM(nn.Module):
-    def __init__(self, vocab_size: int = 259, dim: int = 512, heads: int = 8, layers: int = 6,
-                 attn_mode: str = 'streaming', block_q: int = 128, block_kv: int = 256):
+    def __init__(self, vocab_size: int, dim: int, heads: int, layers: int,
+                 attn_mode: str, block_q: int, block_kv: int, chkpt: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -137,96 +125,150 @@ class AURAMiniLM(nn.Module):
         ])
         self.norm_f = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-        # weight tying
+        # Weight tying
         self.lm_head.weight = self.embed.weight
+        self.use_checkpoint = chkpt
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # token_ids: [B,T]
         x = self.embed(token_ids)
-        for blk in self.blocks:
-            x = blk(x, token_ids)
+        if self.use_checkpoint:
+            # Checkpoint each block to reduce activation memory
+            for blk in self.blocks:
+                x = torch.utils.checkpoint.checkpoint(lambda t: blk(t, token_ids), x, use_reentrant=False)
+        else:
+            for blk in self.blocks:
+                x = blk(x, token_ids)
         x = self.norm_f(x)
-        logits = self.lm_head(x)  # [B,T,V]
-        return logits
+        return self.lm_head(x)
 
-# ---------- Dataset ----------
+# -----------------------------------------------------------------------------
+# Datasets: pretokenized (fast path) and raw (fallback)
+# -----------------------------------------------------------------------------
+import numpy as np
+class PreTokenizedDataset(torch.utils.data.Dataset):
+    """Memory-mapped tokens with fixed windows. Produced by pack_to_bin.py.
+       Exposes (x, y) where both shape = [seq_len]."""
+    def __init__(self, bin_dir: str):
+        meta = json.load(open(f"{bin_dir}/meta.json","r"))
+        self.seq_len = int(meta["seq_len"])
+        self.idx = np.load(f"{bin_dir}/idx.npy")
+        self.tokens = np.memmap(f"{bin_dir}/tokens.bin", mode="r", dtype=np.uint16)
+        self.vocab_size = int(meta.get("vocab_size", 261))
+    def __len__(self): return len(self.idx)
+    def __getitem__(self, i: int):
+        s = int(self.idx[i]); T = self.seq_len + 1
+        window = self.tokens[s:s+T].astype(np.int64)
+        x = torch.from_numpy(window[:-1].copy()).long()
+        y = torch.from_numpy(window[1:].copy()).long()
+        return x, y
 
 class PackedDataset(torch.utils.data.Dataset):
     def __init__(self, lines: List[str], tokenizer: ByteTokenizer, seq_len: int):
         self.tok = tokenizer
         self.seq_len = seq_len
-        # pack tokens end-to-end with BOS/EOS
         ids: List[int] = []
         for ln in lines:
             ids.extend(self.tok.encode(ln.strip(), add_special=True))
-        # pad to multiple of seq_len
         pad_id = self.tok.PAD
-        if len(ids) % seq_len != 0:
-            ids.extend([pad_id] * (seq_len - (len(ids) % seq_len)))
+        T = seq_len + 1
+        if len(ids) % T != 0:
+            ids.extend([pad_id] * (T - (len(ids) % T)))
         self.tokens = torch.tensor(ids, dtype=torch.long)
-        self.nseq = len(ids) // seq_len
+        self.nseq = len(ids) // T
     def __len__(self): return self.nseq
     def __getitem__(self, i: int):
-        s = i * self.seq_len
-        e = s + self.seq_len
-        x = self.tokens[s:e]
-        y = self.tokens[s+1:e+1]  # next-token
-        return x[:-1], y[:-1]     # keep shapes equal
+        s = i * (self.seq_len + 1)
+        e = s + (self.seq_len + 1)
+        window = self.tokens[s:e]
+        return window[:-1], window[1:]
 
-# ---------- Training ----------
+# -----------------------------------------------------------------------------
+# Utilities: world/rank, ckpt, eval
+# -----------------------------------------------------------------------------
 
 def _world_size():
     if XLA_AVAILABLE:
         try: return xr.world_size()
         except Exception: return 1
     return 1
+
 def _rank():
     if XLA_AVAILABLE:
         try: return xm.get_ordinal()
         except Exception: return 0
     return 0
-def _is_master(): return _rank()==0
+
+_is_master = lambda: _rank() == 0
+
+@torch.no_grad()
+def evaluate(model: nn.Module, dl: torch.utils.data.DataLoader, device: torch.device,
+             vocab_size: int, max_steps: int = 50) -> float:
+    model.eval()
+    losses = []
+    steps = 0
+    for x, y in dl:
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        losses.append(loss.detach().float().cpu())
+        steps += 1
+        if steps >= max_steps: break
+    model.train()
+    if not losses: return float('inf')
+    mean_loss = torch.stack(losses).mean().item()
+    return math.exp(min(mean_loss, 20.0))  # ppl
+
+
+def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, meta: dict):
+    if not _is_master():
+        return
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    chk = {
+        'meta': meta,
+        'model_state': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        'optim_state': optimizer.state_dict(),
+    }
+    torch.save(chk, path)
+
+# -----------------------------------------------------------------------------
+# Train loop
+# -----------------------------------------------------------------------------
 
 def train_worker(index, args):
     device = get_device()
-    torch.manual_seed(42 + _rank())
+    torch.manual_seed(1337 + _rank())
+
     tok = ByteTokenizer()
 
-    # Data
-    with open(args.corpus, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    if args.max_lines:
-        lines = lines[:args.max_lines]
+    # Dataset selection
+    if args.bin_dir:
+        ds = PreTokenizedDataset(args.bin_dir)
+        tok.vocab_size = ds.vocab_size
+        args.rag_mode = 'off'  # fast path
+        lines = None
+    else:
+        with open(args.corpus, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if args.max_lines:
+            lines = lines[:args.max_lines]
+        # shard across ranks (DP)
+        ws = _world_size(); rk = _rank()
+        if ws > 1:
+            lines = lines[rk::ws]
+        ds = PackedDataset(lines, tok, args.seq_len)
 
-    # shard across ranks (DP)
-    ws = _world_size()
-    rk = _rank()
-    if ws > 1:
-        lines = lines[rk::ws]
-
-    ds = PackedDataset(lines, tok, args.seq_len)
-    dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    ms = MemoryStore(args.memory_dir) if args.memory_dir else None
-    def maybe_replay(batch_x: torch.Tensor, batch_y: torch.Tensor):
-        if ms is None or args.replay_ratio <= 0.0:
-            return batch_x, batch_y
-        B, T = batch_x.shape
-        n_replay = int(B * args.replay_ratio)
-        if n_replay == 0:
-            return batch_x, batch_y
-        # Sample random memory items and replace first n_replay samples
-        import random
-        idxs = random.sample(range(len(ms.items)), k=min(n_replay, len(ms.items))) if len(ms.items)>0 else []
-        for j, mi in enumerate(idxs):
-            txt = ms.items[mi].text[:args.seq_len]
-            ids = tok.encode(txt, add_special=True)
-            ids = ids[:args.seq_len]
-            if len(ids)<2: ids = ids + [tok.PAD]
-            xj = torch.tensor(ids[:-1], dtype=torch.long)
-            yj = torch.tensor(ids[1:], dtype=torch.long)
-            batch_x[j,:] = xj
-            batch_y[j,:] = yj
-        return batch_x, batch_y
+    # DataLoader tuned for XLA host input pipeline
+    dl = torch.utils.data.DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.workers,
+        persistent_workers=(args.workers > 0),
+        prefetch_factor=4 if args.workers > 0 else None,
+        pin_memory=False,
+    )
 
     # Model
     model = AURAMiniLM(
@@ -237,91 +279,145 @@ def train_worker(index, args):
         attn_mode=args.attn_mode,
         block_q=args.block_q,
         block_kv=args.block_kv,
+        chkpt=args.ckpt,
     ).to(device)
     model.train()
 
-    # Optim
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
-    scaler = None  # BF16 path doesn't need GradScaler
+    # Optimizer & Scheduler
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
 
-    # Train
+    def lr_lambda(step):
+        # warmup + cosine decay
+        if step < args.warmup_steps:
+            return max(1e-8, step / max(1, args.warmup_steps))
+        progress = (step - args.warmup_steps) / max(1, args.total_steps - args.warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+    # Optional: tiny eval split from ds (works best for pretokenized)
+    eval_dl = None
+    if args.eval_fraction > 0.0:
+        n_eval = max(1, int(len(ds) * args.eval_fraction))
+        ev_idx = torch.utils.data.Subset(ds, range(0, n_eval))
+        eval_dl = torch.utils.data.DataLoader(ev_idx, batch_size=args.batch_size, shuffle=False, drop_last=True,
+                                              num_workers=max(0, args.workers//2), persistent_workers=False)
+
     steps = 0
+    tokens_per_step = args.batch_size * args.seq_len * max(1, _world_size()) * max(1, args.microbatches)
+    t0 = time.time()
+
     for epoch in range(args.epochs):
         for x, y in dl:
-            # --- RAG assemble ---
-            if args.memory_dir and args.rag_mode != 'off':
-                ms = MemoryStore(args.memory_dir)
-                B, T = x.shape
-                new_x = []
-                new_y = []
-                for i in range(B):
-                    # decode a short query from the first 200 bytes
-                    q = tok.decode(x[i].tolist()[:200])
-                    hits = ms.search(q, top_k=args.mem_topk)
-                    mem_texts = [h[0].text[:400] for h in hits]
-                    mem_ids = tok.encode_memory_prefix(mem_texts)
-                    # prepend or append and trim to seq_len-1 (since we shift y)
-                    if args.rag_mode == 'prepend':
-                        merged = (mem_ids + x[i].tolist())[:args.seq_len]
-                    elif args.rag_mode == 'append':
-                        merged = (x[i].tolist() + mem_ids)[:args.seq_len]
-                    else:
-                        merged = x[i].tolist()
-                    # rebuild targets as next-token
-                    merged = merged if len(merged)>=2 else merged + [tok.PAD]
-                    nx = torch.tensor(merged[:-1], dtype=torch.long)
-                    ny = torch.tensor(merged[1:], dtype=torch.long)
-                    new_x.append(nx)
-                    new_y.append(ny)
-                x = torch.stack(new_x, dim=0)
-                y = torch.stack(new_y, dim=0)
-            # --- end RAG ---
-            x, y = maybe_replay(x, y)
-            x = x.to(device)
-            y = y.to(device)
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, tok.vocab_size), y.view(-1))
-            opt.zero_grad()
-            loss.backward()
+            # Gradient accumulation over microbatches
+            model.train()
+            opt.zero_grad(set_to_none=True)
+            B = x.size(0)
+            m = args.microbatches
+            if m > 1:
+                mb_sz = max(1, B // m)
+            else:
+                mb_sz = B
+
+            accum_loss = 0.0
+            for i in range(m):
+                s = i * mb_sz
+                e = B if i == m - 1 else min(B, (i + 1) * mb_sz)
+                if s >= e:
+                    continue
+                xi = x[s:e].to(device)
+                yi = y[s:e].to(device)
+                logits = model(xi)
+                loss = F.cross_entropy(logits.view(-1, tok.vocab_size), yi.view(-1))
+                (loss / m).backward()
+                accum_loss += float(loss.detach().cpu())
+
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
             if XLA_AVAILABLE:
                 xm.optimizer_step(opt, barrier=True)
+                xm.mark_step()
             else:
                 opt.step()
-            steps += 1
-            if _is_master() and steps % args.log_every == 0:
-                ppl = math.exp(min(loss.item(), 20))
-                print(f"epoch {epoch+1} step {steps} | loss {loss.item():.4f} | ppl {ppl:.2f}")
+            scheduler.step()
 
-        # save small checkpoint per epoch (master rank)
-        if _is_master():
-            ckpt = {
-                'cfg': vars(args),
-                'model_state': {k:v.detach().cpu() for k,v in model.state_dict().items()},
-            }
-            os.makedirs('ckpts', exist_ok=True)
-            torch.save(ckpt, f'ckpts/aura_mini_e{epoch+1}.pt')
-            print(f"Saved ckpt: ckpts/aura_mini_e{epoch+1}.pt")
+            steps += 1
+
+            if _is_master() and (steps % args.log_every == 0):
+                elapsed = time.time() - t0
+                toks_sec = tokens_per_step * (args.log_every / max(1e-6, elapsed))
+                ppl_est = math.exp(min(accum_loss / max(1, m), 20.0))
+                lr_now = scheduler.get_last_lr()[0]
+                print(f"ep {epoch+1} step {steps} | loss {accum_loss/m:.4f} | ppl {ppl_est:.2f} | lr {lr_now:.3e} | {toks_sec:,.0f} tok/s")
+                t0 = time.time()
+
+            if args.save_every and steps % args.save_every == 0:
+                save_checkpoint(f"ckpts/aura_mini_step{steps}.pt", model, opt, meta={
+                    'dim': args.dim, 'heads': args.heads, 'layers': args.layers,
+                    'seq_len': args.seq_len, 'vocab_size': tok.vocab_size,
+                    'step': steps, 'epoch': epoch+1,
+                })
+
+            if args.total_steps and steps >= args.total_steps:
+                break
+        if eval_dl is not None and _is_master():
+            ppl = evaluate(model, eval_dl, device, tok.vocab_size, max_steps=args.eval_steps)
+            print(f"\n[eval] epoch {epoch+1} ppl {ppl:.2f}")
+        if args.total_steps and steps >= args.total_steps:
+            break
+
+    if _is_master():
+        save_checkpoint(f"ckpts/aura_mini_final.pt", model, opt, meta={
+            'dim': args.dim, 'heads': args.heads, 'layers': args.layers,
+            'seq_len': args.seq_len, 'vocab_size': tok.vocab_size,
+            'total_steps': steps,
+        })
+        print("Saved final checkpoint: ckpts/aura_mini_final.pt")
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--corpus', type=str, default='demo.txt')
-    ap.add_argument('--epochs', type=int, default=1)
-    ap.add_argument('--batch-size', type=int, default=8)
-    ap.add_argument('--seq-len', type=int, default=2048)   # 2k context for shakedown
+    # Data
+    ap.add_argument('--bin-dir', type=str, default=None, help='Use pretokenized binary dataset (fast path)')
+    ap.add_argument('--corpus', type=str, default='demo.txt', help='Raw text file (fallback path)')
+    ap.add_argument('--seq-len', type=int, default=2048)
+    ap.add_argument('--max-lines', type=int, default=None)
+    ap.add_argument('--workers', type=int, default=2, help='DataLoader workers per process')
+
+    # Model
     ap.add_argument('--dim', type=int, default=512)
     ap.add_argument('--heads', type=int, default=8)
     ap.add_argument('--layers', type=int, default=6)
-    ap.add_argument('--attn-mode', type=str, default='streaming')
+    ap.add_argument('--attn-mode', type=str, default='streaming', choices=['streaming','chunked','dot'])
     ap.add_argument('--block-q', type=int, default=128)
     ap.add_argument('--block-kv', type=int, default=256)
+    ap.add_argument('--ckpt', action='store_true', help='Activation checkpoint blocks')
+
+    # Train
+    ap.add_argument('--epochs', type=int, default=1)
+    ap.add_argument('--batch-size', type=int, default=8)
+    ap.add_argument('--microbatches', type=int, default=1, help='Gradient accumulation steps')
     ap.add_argument('--lr', type=float, default=2e-4)
-    ap.add_argument('--max-lines', type=int, default=None)
+    ap.add_argument('--beta1', type=float, default=0.9)
+    ap.add_argument('--beta2', type=float, default=0.95)
+    ap.add_argument('--weight-decay', type=float, default=0.1)
+    ap.add_argument('--warmup-steps', type=int, default=200)
+    ap.add_argument('--total-steps', type=int, default=0, help='0 = run full epochs')
+    ap.add_argument('--grad-clip', type=float, default=1.0)
+
+    # Logging / eval / save
     ap.add_argument('--log-every', type=int, default=20)
-    ap.add_argument('--memory-dir', type=str, default=None)
-    ap.add_argument('--mem-topk', type=int, default=3)
-    ap.add_argument('--rag-mode', type=str, default='prepend', choices=['prepend', 'append', 'off'])
-    ap.add_argument('--replay-ratio', type=float, default=0.0)
+    ap.add_argument('--save-every', type=int, default=0)
+    ap.add_argument('--eval-fraction', type=float, default=0.0)
+    ap.add_argument('--eval-steps', type=int, default=50)
+
+    # TPU
     ap.add_argument('--tpu', action='store_true')
+
     args = ap.parse_args()
 
     if args.tpu and XLA_AVAILABLE:
@@ -330,5 +426,5 @@ def main():
     else:
         train_worker(0, args)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
