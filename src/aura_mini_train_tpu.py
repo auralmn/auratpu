@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-AURA Mini LLM — TPU-ready trainer (with --tpu-cores)
+AURA Mini LLM — TPU-ready trainer (torch-xla 2.8 compatible)
 
-Highlights
-- PyTorch/XLA multi-process (xmp.spawn), BF16 on TPU, `--tpu-cores` to control nprocs.
-- Pre-tokenized mmap dataset (--bin-dir) for max throughput; raw text fallback.
+- Uses PJRT (PJRT_DEVICE=TPU). For core count, set env TPU_NUM_DEVICES
+  (or restrict with TPU_VISIBLE_CHIPS). spawn() is called without nprocs.
+- Pre-tokenized mmap dataset (--bin-dir) or raw-text fallback.
 - Neuromorphic SRWKV mixer with streaming softmax (from neuromorphic_srwkv_tpu.py).
 - Grad accumulation, grad clipping, cosine LR warmup/decay.
 - Smoothed loss meters (EMA + rolling window) averaged across TPU cores.
-- Rank-aware logger using xm.master_print on TPU so logs actually show.
-
-Recommended (after pretokenizing on CPU):
-  python aura_mini_train_tpu.py --tpu --tpu-cores 8 \
-    --bin-dir data_bin --epochs 1 --batch-size 8 --microbatches 4 \
-    --seq-len 2048 --dim 512 --heads 8 --layers 6 \
-    --attn-mode streaming --block-q 128 --block-kv 256 --lr 2e-4
+- Rank-aware logging via xm.master_print.
 """
 
 from __future__ import annotations
@@ -25,8 +19,7 @@ import math
 import json
 import time
 import argparse
-from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List
 from collections import deque
 
 import torch
@@ -59,20 +52,15 @@ from neuromorphic_srwkv_tpu import NeuromorphicSRWKVTpu, get_device, DEFAULT_DTY
 # -----------------------------------------------------------------------------
 class ByteTokenizer:
     def __init__(self):
-        # bytes 0..255 + PAD/BOS/EOS/MEM/SEP
         self.PAD, self.BOS, self.EOS, self.MEM, self.SEP = 256, 257, 258, 259, 260
         self.vocab_size = 261
-
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         ids = list(text.encode('utf-8', errors='ignore'))
         return ([self.BOS] + ids + [self.EOS]) if add_special else ids
-
     def decode(self, ids: List[int]) -> str:
         b = [i for i in ids if 0 <= i < 256]
-        try:
-            return bytes(b).decode('utf-8', errors='ignore')
-        except Exception:
-            return bytes(b).decode('latin-1', errors='ignore')
+        try: return bytes(b).decode('utf-8', errors='ignore')
+        except Exception: return bytes(b).decode('latin-1', errors='ignore')
 
 # -----------------------------------------------------------------------------
 # Model blocks
@@ -102,7 +90,7 @@ class AURABlock(nn.Module):
         cfg = {
             'embedding_dim': dim,
             'num_heads': heads,
-            'attn_mode': attn_mode,       # 'streaming' | 'chunked' | 'dot'
+            'attn_mode': attn_mode,
             'block_size_q': block_q,
             'block_size_kv': block_kv,
             'spike_threshold': 0.5,
@@ -113,7 +101,6 @@ class AURABlock(nn.Module):
         self.mix = NeuromorphicSRWKVTpu(cfg)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, hidden_mult=4.0)
-
     def forward(self, x: torch.Tensor, token_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = x + self.mix(self.norm1(x), token_ids)
         x = x + self.mlp(self.norm2(x))
@@ -124,17 +111,14 @@ class AURAMiniLM(nn.Module):
                  attn_mode: str, block_q: int, block_kv: int, chkpt: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
-        self.dim = dim
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList([
             AURABlock(dim, heads, attn_mode, block_q, block_kv) for _ in range(layers)
         ])
         self.norm_f = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-        # weight tying
-        self.lm_head.weight = self.embed.weight
+        self.lm_head.weight = self.embed.weight  # weight tying
         self.use_checkpoint = chkpt
-
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed(token_ids)
         if self.use_checkpoint:
@@ -150,8 +134,7 @@ class AURAMiniLM(nn.Module):
 # Datasets (pretokenized fast path + raw fallback)
 # -----------------------------------------------------------------------------
 class PreTokenizedDataset(torch.utils.data.Dataset):
-    """Memmap tokens with fixed windows; produced by pack_to_bin.py.
-       Returns (x, y) each shape [seq_len]."""
+    """Memmap tokens with fixed windows; produced by pack_to_bin.py. Returns (x,y)."""
     def __init__(self, bin_dir: str):
         meta = json.load(open(f"{bin_dir}/meta.json","r"))
         self.seq_len = int(meta["seq_len"])
@@ -203,8 +186,7 @@ def _world_size():
 
 _is_master = lambda: _rank() == 0
 
-def log(*args, **kwargs):
-    """Rank-aware logger: consolidates output on TPU master and flushes."""
+def log(*args):
     msg = " ".join(str(a) for a in args)
     if XLA_AVAILABLE:
         xm.master_print(msg)
@@ -213,31 +195,21 @@ def log(*args, **kwargs):
 
 class EmaMeter:
     def __init__(self, beta: float = 0.98):
-        self.beta = float(beta)
-        self.value = None
-        self.count = 0
+        self.beta = float(beta); self.value = None; self.count = 0
     def update(self, x: float):
-        if self.value is None:
-            self.value = float(x)
-        else:
-            self.value = self.beta * self.value + (1.0 - self.beta) * float(x)
+        self.value = float(x) if self.value is None else self.beta*self.value + (1.0-self.beta)*float(x)
         self.count += 1
 
 class WindowMean:
     def __init__(self, window: int = 100):
         self.buf = deque(maxlen=int(window))
-    def update(self, x: float):
-        self.buf.append(float(x))
+    def update(self, x: float): self.buf.append(float(x))
     @property
-    def value(self) -> float:
-        if not self.buf: return float('nan')
-        return sum(self.buf) / len(self.buf)
+    def value(self) -> float: return float('nan') if not self.buf else sum(self.buf)/len(self.buf)
     @property
-    def count(self) -> int:
-        return len(self.buf)
+    def count(self) -> int: return len(self.buf)
 
 def _dist_mean_scalar(x: float, device: torch.device) -> float:
-    """Average a Python float across TPU cores if XLA present; else return x."""
     if XLA_AVAILABLE:
         t = torch.tensor([x], device=device, dtype=torch.float32)
         xm.all_reduce(xm.REDUCE_MEAN, [t])
@@ -247,35 +219,27 @@ def _dist_mean_scalar(x: float, device: torch.device) -> float:
 @torch.no_grad()
 def evaluate(model: nn.Module, dl: torch.utils.data.DataLoader, device: torch.device,
              vocab_size: int, max_steps: int = 50) -> float:
-    model.eval()
-    losses = []
-    steps = 0
+    model.eval(); losses = []; steps = 0
     for x, y in dl:
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device); y = y.to(device)
         logits = model(x)
         loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-        losses.append(loss.detach().float().cpu())
-        steps += 1
+        losses.append(loss.detach().float().cpu()); steps += 1
         if steps >= max_steps: break
     model.train()
     if not losses: return float('inf')
-    mean_loss = torch.stack(losses).mean().item()
-    return math.exp(min(mean_loss, 20.0))  # ppl
+    return math.exp(min(torch.stack(losses).mean().item(), 20.0))
 
 def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, meta: dict):
-    if not _is_master():
-        return
+    if not _is_master(): return
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    chk = {
-        'meta': meta,
-        'model_state': {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        'optim_state': optimizer.state_dict(),
-    }
+    chk = {'meta': meta,
+           'model_state': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+           'optim_state': optimizer.state_dict()}
     torch.save(chk, path)
 
 # -----------------------------------------------------------------------------
-# Train loop (single process body)
+# Train loop (worker)
 # -----------------------------------------------------------------------------
 def train_worker(index, args):
     device = get_device()
@@ -283,24 +247,23 @@ def train_worker(index, args):
 
     tok = ByteTokenizer()
 
-    # Dataset (and sampler so each TPU core sees disjoint data)
+    # Runtime world size / rank (now accurate inside worker)
+    ws = _world_size()
+    rk = _rank()
+
+    # Dataset + per-rank sampler
     if args.bin_dir:
         ds = PreTokenizedDataset(args.bin_dir)
         tok.vocab_size = ds.vocab_size
-        eval_dl = None
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            ds, num_replicas=args.tpu_cores if args.tpu else 1, rank=_rank(), shuffle=True, drop_last=True
-        ) if args.tpu else None
     else:
         with open(args.corpus, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        if args.max_lines:
-            lines = lines[:args.max_lines]
+        if args.max_lines: lines = lines[:args.max_lines]
         ds = PackedDataset(lines, tok, args.seq_len)
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            ds, num_replicas=args.tpu_cores if args.tpu else 1, rank=_rank(), shuffle=True, drop_last=True
-        ) if args.tpu else None
-        eval_dl = None
+
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        ds, num_replicas=ws, rank=rk, shuffle=True, drop_last=True
+    ) if XLA_AVAILABLE else None
 
     dl = torch.utils.data.DataLoader(
         ds,
@@ -315,7 +278,7 @@ def train_worker(index, args):
     )
 
     # Startup logs
-    log(f"rank {_rank()}/{args.tpu_cores if args.tpu else 1} | device={device} | dtype={DEFAULT_DTYPE}")
+    log(f"rank {rk}/{ws} | device={device} | dtype={DEFAULT_DTYPE}")
     log(f"dataset windows={len(ds)} | seq_len={args.seq_len} | batch_size={args.batch_size} | microbatches={args.microbatches} | log_every={args.log_every}")
 
     # Model
@@ -335,31 +298,28 @@ def train_worker(index, args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
 
     def lr_lambda(step):
-        # warmup + cosine decay
         if step < args.warmup_steps:
             return max(1e-8, step / max(1, args.warmup_steps))
-        progress = (step - args.warmup_steps) / max(1, args.total_steps - args.warmup_steps) if args.total_steps > 0 else 0.0
+        if args.total_steps <= args.warmup_steps: return 1.0
+        progress = (step - args.warmup_steps) / (args.total_steps - args.warmup_steps)
         progress = max(0.0, min(1.0, progress))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
-    # Smoothed loss meters
     ema_loss = EmaMeter(beta=args.ema_beta)
     win_loss = WindowMean(window=args.avg_window)
 
     steps = 0
-    ws = args.tpu_cores if args.tpu else 1
     tokens_per_step = args.batch_size * args.seq_len * ws * max(1, args.microbatches)
     log(f"global tokens/step ≈ {tokens_per_step:,}")
     t0 = time.time()
 
     for epoch in range(args.epochs):
         if sampler is not None:
-            sampler.set_epoch(epoch)  # ensure different shuffles across epochs
+            sampler.set_epoch(epoch)
 
         for x, y in dl:
-            # Gradient accumulation over microbatches
             model.train()
             opt.zero_grad(set_to_none=True)
             B = x.size(0)
@@ -370,10 +330,8 @@ def train_worker(index, args):
             for i in range(m):
                 s = i * mb_sz
                 e = B if i == m - 1 else min(B, (i + 1) * mb_sz)
-                if s >= e:
-                    continue
-                xi = x[s:e].to(device)
-                yi = y[s:e].to(device)
+                if s >= e: continue
+                xi = x[s:e].to(device); yi = y[s:e].to(device)
                 logits = model(xi)
                 loss = F.cross_entropy(logits.view(-1, tok.vocab_size), yi.view(-1))
                 (loss / m).backward()
@@ -389,7 +347,6 @@ def train_worker(index, args):
                 opt.step()
             scheduler.step()
 
-            # Distributed-averaged per-step loss
             step_loss = accum_loss / m
             step_loss_global = _dist_mean_scalar(step_loss, device)
             ema_loss.update(step_loss_global)
@@ -426,7 +383,7 @@ def train_worker(index, args):
             break
 
     if _is_master():
-        save_checkpoint(f"ckpts/aura_mini_final.pt", model, opt, meta={
+        save_checkpoint("ckpts/aura_mini_final.pt", model, opt, meta={
             'dim': args.dim, 'heads': args.heads, 'layers': args.layers,
             'seq_len': args.seq_len, 'vocab_size': tok.vocab_size,
             'total_steps': steps,
@@ -440,11 +397,11 @@ def main():
     ap = argparse.ArgumentParser()
 
     # Data
-    ap.add_argument('--bin-dir', type=str, default=None, help='Use pretokenized binary dataset (fast path)')
-    ap.add_argument('--corpus', type=str, default='demo.txt', help='Raw text file (fallback path)')
+    ap.add_argument('--bin-dir', type=str, default=None)
+    ap.add_argument('--corpus', type=str, default='demo.txt')
     ap.add_argument('--seq-len', type=int, default=2048)
     ap.add_argument('--max-lines', type=int, default=None)
-    ap.add_argument('--workers', type=int, default=2, help='DataLoader workers per process')
+    ap.add_argument('--workers', type=int, default=2)
 
     # Model
     ap.add_argument('--dim', type=int, default=512)
@@ -453,35 +410,39 @@ def main():
     ap.add_argument('--attn-mode', type=str, default='streaming', choices=['streaming','chunked','dot'])
     ap.add_argument('--block-q', type=int, default=128)
     ap.add_argument('--block-kv', type=int, default=256)
-    ap.add_argument('--ckpt', action='store_true', help='Activation checkpoint blocks')
+    ap.add_argument('--ckpt', action='store_true')
 
     # Train
     ap.add_argument('--epochs', type=int, default=1)
     ap.add_argument('--batch-size', type=int, default=8)
-    ap.add_argument('--microbatches', type=int, default=1, help='Gradient accumulation steps')
+    ap.add_argument('--microbatches', type=int, default=1)
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--beta1', type=float, default=0.9)
     ap.add_argument('--beta2', type=float, default=0.95)
     ap.add_argument('--weight-decay', type=float, default=0.1)
     ap.add_argument('--warmup-steps', type=int, default=200)
-    ap.add_argument('--total-steps', type=int, default=0, help='0 = run full epochs')
+    ap.add_argument('--total-steps', type=int, default=0)
     ap.add_argument('--grad-clip', type=float, default=1.0)
 
     # Smoothed loss
-    ap.add_argument('--ema-beta', type=float, default=0.98, help='EMA smoothing for loss display')
-    ap.add_argument('--avg-window', type=int, default=100, help='Rolling window size for mean loss')
+    ap.add_argument('--ema-beta', type=float, default=0.98)
+    ap.add_argument('--avg-window', type=int, default=100)
 
-    # TPU
+    # TPU controls (torch-xla 2.8+)
     ap.add_argument('--tpu', action='store_true')
-    ap.add_argument('--tpu-cores', type=int, default=8, help='Processes to spawn (usually 8 on v4-8 and v4-32 slices)')
+    ap.add_argument('--tpu-cores', type=int, default=0,
+                    help='If >0, sets env TPU_NUM_DEVICES before spawn; spawn nprocs is None')
 
     args = ap.parse_args()
 
     if args.tpu:
         if not XLA_AVAILABLE:
-            raise RuntimeError("torch-xla is not available. Install torch-xla[tpuvm] and set PJRT_DEVICE=TPU.")
-        # explicit nprocs avoids relying on xr.world_size() before runtime init
-        xmp.spawn(train_worker, args=(args,), nprocs=args.tpu_cores, start_method='fork')
+            raise RuntimeError("torch-xla unavailable. Install torch-xla and set PJRT_DEVICE=TPU.")
+        # torch-xla 2.8 expects you to limit devices via env; spawn() picks them up.
+        if args.tpu_cores and os.environ.get('TPU_NUM_DEVICES') is None:
+            os.environ['TPU_NUM_DEVICES'] = str(int(args.tpu_cores))
+        # If you need to skip bad chips, set TPU_VISIBLE_CHIPS="0,1,3" in your shell before running.
+        xmp.spawn(train_worker, args=(args,), start_method='fork')
     else:
         train_worker(0, args)
 
