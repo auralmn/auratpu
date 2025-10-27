@@ -104,12 +104,19 @@ class SpikingKWTA(nn.Module):
 
         gains = torch.ones(V, device=self.device, dtype=self.dtype)
         active = spikes > 0
-        if int(active.sum().item()) > 0:
+        if active.any():
+            # choose winners **among active** IDs
             values = spikes.to(torch.float32) * 1e6 + potentials.to(torch.float32)
-            k = min(self.config.k_winners, V)
-            topk = torch.topk(values, k=k, largest=True).indices
-            gains = gains.scatter(0, active.nonzero(as_tuple=False).view(-1), torch.as_tensor(self.config.gain_down, device=self.device, dtype=self.dtype))
-            gains[topk] = torch.as_tensor(self.config.gain_up, device=self.device, dtype=self.dtype)
+            active_idx = active.nonzero(as_tuple=False).view(-1)           # [Na]
+            k = int(min(self.config.k_winners, max(1, active_idx.numel())))
+
+            # rank only the active items
+            top_local = torch.topk(values[active_idx], k=k, largest=True).indices
+            topk_idx = active_idx[top_local]                                # [k]
+
+            # set default down-gain for all active, then up-gain for winners
+            gains[active_idx] = float(self.config.gain_down)
+            gains[topk_idx]   = float(self.config.gain_up)
         return gains
 
 
