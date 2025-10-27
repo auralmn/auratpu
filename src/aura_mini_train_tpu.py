@@ -3,13 +3,11 @@
 """
 AURA Mini LLM — TPU-ready trainer (torch-xla 2.8 / PJRT)
 
-- Uses PJRT (set: PJRT_DEVICE=TPU). torch-xla 2.8 expects you to limit device
-  count via env: TPU_NUM_DEVICES (or TPU_VISIBLE_CHIPS); spawn() gets it.
-- Pre-tokenized mmap dataset (--bin-dir) for max throughput; raw-text fallback.
-- Neuromorphic SRWKV mixer with streaming softmax (from neuromorphic_srwkv_tpu.py).
-- Grad accumulation, grad clipping, cosine LR warmup/decay.
-- Smoothed loss meters (EMA + rolling window), averaged across TPU cores.
-- Rank-aware logging via xm.master_print and --log-every.
+- PJRT path: set env PJRT_DEVICE=TPU (and optionally TPU_NUM_DEVICES / TPU_VISIBLE_CHIPS)
+- Uses xm.master_print for rank-0 logging; add --log-every and --log-file
+- Supports pretokenized mmap dataset (--bin-dir) or raw text (--corpus)
+- Grad accumulation, grad clipping, cosine LR warmup/decay
+- Smoothed loss meters (EMA + rolling window), averaged across TPU cores
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ import torch.nn.functional as F
 import numpy as np
 
 # -----------------------------------------------------------------------------
-# XLA (TPU)
+# XLA (TPU) — torch-xla 2.8 uses PJRT and env TPU_NUM_DEVICES / TPU_VISIBLE_CHIPS
 # -----------------------------------------------------------------------------
 XLA_AVAILABLE = False
 try:
@@ -170,7 +168,7 @@ class PackedDataset(torch.utils.data.Dataset):
         return window[:-1], window[1:]
 
 # -----------------------------------------------------------------------------
-# Utilities: rank/world, logging, ckpt, eval, smooth meters
+# Utilities: ranks, logging, ckpt, eval, smoothing
 # -----------------------------------------------------------------------------
 def _rank():
     if XLA_AVAILABLE:
@@ -184,14 +182,26 @@ def _world_size():
         except Exception: return 1
     return 1
 
-_is_master = lambda: _rank() == 0
+def make_logger(log_file: str):
+    """Rank-aware console logger that can also tee to a file (rank-0 only)."""
+    invalid = {'', '-', '<stdout>', '<stderr>', '<stdin>'}
+    fh = None
+    path = (log_file or '').strip()
+    if (_rank() == 0) and path not in invalid:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            fh = open(path, "a", buffering=1)  # line-buffered
+        except Exception as e:
+            print(f"[log] could not open {path}: {e}", flush=True)
+            fh = None
 
-def log(*args):
-    msg = " ".join(str(a) for a in args)
-    if XLA_AVAILABLE:
-        xm.master_print(msg)
-    else:
-        print(msg, flush=True)
+    def _log(*args):
+        msg = " ".join(str(a) for a in args)
+        if XLA_AVAILABLE: xm.master_print(msg)
+        else: print(msg, flush=True)
+        if fh is not None:
+            print(msg, file=fh, flush=True)
+    return _log
 
 class EmaMeter:
     def __init__(self, beta: float = 0.98):
@@ -230,18 +240,22 @@ def evaluate(model: nn.Module, dl: torch.utils.data.DataLoader, device: torch.de
     if not losses: return float('inf')
     return math.exp(min(torch.stack(losses).mean().item(), 20.0))
 
-def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, meta: dict):
-    if not _is_master(): return
+def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, meta: dict, log):
+    if _rank() != 0: return
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     chk = {'meta': meta,
            'model_state': {k: v.detach().cpu() for k, v in model.state_dict().items()},
            'optim_state': optimizer.state_dict()}
     torch.save(chk, path)
+    log(f"Saved checkpoint: {path}")
 
 # -----------------------------------------------------------------------------
 # Train loop (worker)
 # -----------------------------------------------------------------------------
 def train_worker(index, args):
+    # Per-process logger (file tee only on rank-0)
+    log = make_logger(getattr(args, 'log_file', ''))
+
     device = get_device()
     torch.manual_seed(1337 + _rank())
 
@@ -277,9 +291,13 @@ def train_worker(index, args):
         pin_memory=False,
     )
 
-    # Startup logs
+    # Startup logs + rendezvous to flush PJRT prints early
     log(f"rank {rk}/{ws} | device={device} | dtype={DEFAULT_DTYPE}")
     log(f"dataset windows={len(ds)} | seq_len={args.seq_len} | batch_size={args.batch_size} | microbatches={args.microbatches} | log_every={args.log_every}")
+    if XLA_AVAILABLE:
+        xm.rendezvous('startup')
+        log("startup rendezvous complete")
+        xm.mark_step()
 
     # Model
     model = AURAMiniLM(
@@ -308,6 +326,7 @@ def train_worker(index, args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
+    # Smoothed loss meters
     ema_loss = EmaMeter(beta=args.ema_beta)
     win_loss = WindowMean(window=args.avg_window)
 
@@ -355,7 +374,7 @@ def train_worker(index, args):
 
             steps += 1
 
-            if _is_master() and (steps % args.log_every == 0):
+            if (_rank() == 0) and (steps % args.log_every == 0):
                 elapsed = time.time() - t0
                 toks_sec = tokens_per_step * (args.log_every / max(1e-6, elapsed))
                 lr_now = scheduler.get_last_lr()[0]
@@ -375,7 +394,7 @@ def train_worker(index, args):
                     'dim': args.dim, 'heads': args.heads, 'layers': args.layers,
                     'seq_len': args.seq_len, 'vocab_size': tok.vocab_size,
                     'step': steps, 'epoch': epoch+1,
-                })
+                }, log=log)
 
             if args.total_steps and steps >= args.total_steps:
                 break
@@ -383,13 +402,12 @@ def train_worker(index, args):
         if args.total_steps and steps >= args.total_steps:
             break
 
-    if _is_master():
+    if _rank() == 0:
         save_checkpoint("ckpts/aura_mini_final.pt", model, opt, meta={
             'dim': args.dim, 'heads': args.heads, 'layers': args.layers,
             'seq_len': args.seq_len, 'vocab_size': tok.vocab_size,
             'total_steps': steps,
-        })
-        log("Saved final checkpoint: ckpts/aura_mini_final.pt")
+        }, log=log)
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -402,7 +420,7 @@ def main():
     ap.add_argument('--corpus', type=str, default='demo.txt')
     ap.add_argument('--seq-len', type=int, default=2048)
     ap.add_argument('--max-lines', type=int, default=None)
-    ap.add_argument('--workers', type=int, default=2)
+    ap.add_argument('--workers', type=int, default=0)  # 0 avoids TPU worker MP hiccups
 
     # Model
     ap.add_argument('--dim', type=int, default=512)
@@ -427,8 +445,10 @@ def main():
 
     # Logging / smoothing
     ap.add_argument('--log-every', type=int, default=20, help='Steps between log lines (rank-0)')
+    ap.add_argument('--log-file', type=str, default='', help='Optional: rank-0 also writes here')
     ap.add_argument('--ema-beta', type=float, default=0.98)
     ap.add_argument('--avg-window', type=int, default=100)
+    ap.add_argument('--save-every', type=int, default=0, help='Save checkpoint every N steps (0=off)')
 
     # TPU controls (torch-xla 2.8+)
     ap.add_argument('--tpu', action='store_true')
@@ -442,6 +462,7 @@ def main():
             raise RuntimeError("torch-xla unavailable. Install torch-xla and set PJRT_DEVICE=TPU.")
         if args.tpu_cores and os.environ.get('TPU_NUM_DEVICES') is None:
             os.environ['TPU_NUM_DEVICES'] = str(int(args.tpu_cores))
+        # If a device is flaky, pre-set TPU_VISIBLE_CHIPS="0,1,3" in your shell.
         xmp.spawn(train_worker, args=(args,), start_method='fork')  # nprocs comes from env
     else:
         train_worker(0, args)
