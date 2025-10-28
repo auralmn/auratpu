@@ -1,6 +1,7 @@
 import argparse, sys, os, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src", "experiments"))
 
 def run_tests(k=None, start_dir="tests", verbosity=1):
     loader = unittest.TestLoader()
@@ -59,6 +60,15 @@ def main():
     p_jax.add_argument("args", nargs=argparse.REMAINDER)
 
     p_jaxv = sp.add_parser("validate-jax")
+
+    p_comp = sp.add_parser("intent-compass")
+    p_comp.add_argument("args", nargs=argparse.REMAINDER)
+
+    p_aoc = sp.add_parser("ao-classify")
+    p_aoc.add_argument("args", nargs=argparse.REMAINDER)
+
+    p_aocj = sp.add_parser("ao-classify-jax")
+    p_aocj.add_argument("args", nargs=argparse.REMAINDER)
 
     args = ap.parse_args()
 
@@ -128,6 +138,30 @@ def main():
         from neuromorphic_srwkv_jax import validate_model
         res = validate_model(model, key)
         print(res)
+    elif args.cmd == "intent-compass":
+        import shadowbank_compass as mod
+        argv = ["prog"] + args.args
+        save = sys.argv; sys.argv = argv
+        try:
+            mod.main()
+        finally:
+            sys.argv = save
+    elif args.cmd == "ao-classify":
+        import addition_only_classifier_torch as mod
+        argv = ["prog"] + args.args
+        save = sys.argv; sys.argv = argv
+        try:
+            mod.main()
+        finally:
+            sys.argv = save
+    elif args.cmd == "ao-classify-jax":
+        import addition_only_classifier_jax as mod
+        argv = ["prog"] + args.args
+        save = sys.argv; sys.argv = argv
+        try:
+            mod.main()
+        finally:
+            sys.argv = save
 
 if __name__ == "__main__":
     main()
