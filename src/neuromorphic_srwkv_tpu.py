@@ -384,6 +384,18 @@ class NeuromorphicSRWKVTpu(nn.Module):
     # ---------- Public API ----------
 
     def forward(self, x: torch.Tensor, token_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Align internal device with input tensor device in case module was .to()-moved after init
+        in_dev = x.device
+        if in_dev != self.device_:
+            self.device_ = in_dev
+            # Move buffers lazily
+            try:
+                self.learning_rates = self.learning_rates.to(in_dev)
+                self.adaptation_ema = self.adaptation_ema.to(in_dev)
+                self.prev_state = self.prev_state.to(in_dev)
+                self.attention_weights = self.attention_weights.to(in_dev)
+            except Exception:
+                pass
         return self.compute_neuromorphic_attention(x, x, x, token_ids)
 
     def get_spike_statistics(self) -> Dict[str, float]:

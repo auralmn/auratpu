@@ -72,6 +72,19 @@ class RandomProjectionEmbedder:
         mat[(probs >= 1/6) & (probs < 2/6)] = 1.0
         self.R = mat / math.sqrt(self.d_in)
 
+    def __call__(self, ids: List[int]) -> torch.Tensor:
+        # ids are in byte space with special markers; build histogram over 0..258
+        hist = torch.zeros(self.d_in, dtype=torch.float32)
+        if ids:
+            # clamp to valid range
+            t = torch.tensor(ids, dtype=torch.long)
+            t = torch.clamp(t, 0, self.d_in - 1)
+            # bincount to histogram length d_in
+            bc = torch.bincount(t, minlength=self.d_in).to(torch.float32)
+            hist = bc / (float(bc.sum().item()) + 1e-9)
+        # Project: [d_out, d_in] @ [d_in] -> [d_out]
+        return self.R @ hist
+
 class MemoryStore:
     def __init__(self, path: str, d_embed: int = 512, embedder: Optional[Callable[[List[int]], torch.Tensor]] = None):
         self.path = path

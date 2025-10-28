@@ -4,4 +4,37 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.2",
+]
+
+[project.scripts]
+"aura-tpu" = "main:main"
+
+[project.optional-dependencies]
+web = ["mmh3>=4.0.0"]
+spm = ["sentencepiece>=0.1.99"]
+tpu = ["torch-xla>=2.3"]
+jax = [
+  "jax>=0.4.26",
+  "flax>=0.8.2",
+  "optax>=0.2.2",
+]
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+# Convenience scripts for uv users (uv run <script>)
+[tool.uv.scripts]
+test = "python3 main.py test"
+train-mini = "python3 main.py train-mini --"
+train-mini-small = "python3 main.py train-mini-small --"
+pretrain-snn = "python3 main.py pretrain-snn --"
+clean-pack = "python3 main.py clean-pack"
+fast-clean-pack = "python3 main.py fast-clean-pack"
+pack-to-bin = "python3 main.py pack-to-bin --"
+memory-ingest = "python3 main.py memory-ingest --"
+train-jax = "python3 main.py train-jax --"
+validate-jax = "python3 main.py validate-jax"
